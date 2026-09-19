@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.core.config import settings
 from backend.api import health, auth
 from backend.api import demand as demand_api
+from backend.api import forecast as forecast_api
 from backend.db.session import create_tables
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ app.add_middleware(
 app.include_router(health.router,        prefix=settings.API_V1_STR,                   tags=["Health"])
 app.include_router(auth.router,          prefix=f"{settings.API_V1_STR}/auth",          tags=["Auth"])
 app.include_router(demand_api.router,    prefix=f"{settings.API_V1_STR}/demand",        tags=["Demand Aggregation"])
+app.include_router(forecast_api.router,  prefix=f"{settings.API_V1_STR}/forecast",      tags=["Demand Forecasting"])
 
 
 @app.get("/")
@@ -62,5 +64,6 @@ def root():
         "docs":    f"{settings.API_V1_STR}/docs",
         "health":  f"{settings.API_V1_STR}/health",
         "demand":  f"{settings.API_V1_STR}/demand",
+        "forecast": f"{settings.API_V1_STR}/forecast",
     }
 

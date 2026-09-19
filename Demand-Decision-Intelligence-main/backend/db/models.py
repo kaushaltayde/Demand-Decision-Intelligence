@@ -7,6 +7,9 @@ Tables created here:
   upload_jobs          – one row per file upload attempt
   sales_records        – validated/cleaned individual transaction rows
   daily_product_demand – aggregated daily demand (the ML team's input)
+  forecast_runs        – one row per triggered forecast job
+  forecast_points      – per-day predictions with confidence intervals
+  forecast_evaluations – aggregated error metrics per run
 
 Convention: snake_case column names (per CONVENTIONS.md).
 """
@@ -213,3 +216,176 @@ class DailyProductDemand(Base):
             f"product={self.product_id} city={self.city_name!r} "
             f"qty={self.total_quantity}>"
         )
+
+
+# ---------------------------------------------------------------------------
+# ForecastRun  (Stage 5)
+# ---------------------------------------------------------------------------
+
+class ForecastRun(Base):
+    """
+    One row per triggered forecast job.
+
+    A single POST /api/forecast/run may create many ForecastRun rows —
+    one for every (product_id × city_name × model_name × horizon_days)
+    combination requested.
+
+    Status lifecycle: pending → complete | failed
+    """
+
+    __tablename__ = "forecast_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Source data reference
+    upload_job_id = Column(
+        Integer,
+        ForeignKey("upload_jobs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # Forecast scope
+    product_id  = Column(String(64),  nullable=False, index=True)
+    city_name   = Column(String(128), nullable=False)
+
+    # Model configuration
+    model_name   = Column(
+        String(32),
+        nullable=False,
+        comment="naive | moving_avg | prophet",
+    )
+    horizon_days = Column(Integer, nullable=False, comment="7, 14, or 30")
+
+    # Chronological splits (dates, not datetimes)
+    train_start = Column(Date, nullable=True)
+    train_end   = Column(Date, nullable=True)
+    val_start   = Column(Date, nullable=True)
+    val_end     = Column(Date, nullable=True)
+
+    # Job status
+    status        = Column(String(16), default="pending", nullable=False,
+                           comment="pending | complete | failed")
+    error_message = Column(Text, nullable=True)
+
+    # Timestamps
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    # Relationships
+    points     = relationship("ForecastPoint",      back_populates="run",
+                              cascade="all, delete-orphan", lazy="dynamic")
+    evaluation = relationship("ForecastEvaluation", back_populates="run",
+                              uselist=False, cascade="all, delete-orphan")
+    upload_job = relationship("UploadJob", foreign_keys=[upload_job_id])
+
+    __table_args__ = (
+        Index("ix_forecast_runs_product_model", "product_id", "model_name"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ForecastRun id={self.id} product={self.product_id!r} "
+            f"model={self.model_name!r} horizon={self.horizon_days}d "
+            f"status={self.status!r}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# ForecastPoint  (Stage 5)
+# ---------------------------------------------------------------------------
+
+class ForecastPoint(Base):
+    """
+    One row per (forecast_run, forecast_date).
+
+    Stores the point prediction and 80 % confidence interval.
+    For dates within the historical test window, `actual` is populated
+    so evaluation metrics can be computed or re-computed.
+    `is_future` is True for dates beyond the last observed data date.
+    """
+
+    __tablename__ = "forecast_points"
+
+    id = Column(BigInteger, primary_key=True, index=True)
+
+    run_id = Column(
+        Integer,
+        ForeignKey("forecast_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    forecast_date = Column(Date,           nullable=False)
+    yhat          = Column(Numeric(14, 4), nullable=False, comment="point prediction")
+    yhat_lower    = Column(Numeric(14, 4), nullable=True,  comment="80% CI lower")
+    yhat_upper    = Column(Numeric(14, 4), nullable=True,  comment="80% CI upper")
+    actual        = Column(Numeric(14, 4), nullable=True,
+                           comment="actual demand (test period only; NULL for future)")
+    is_future     = Column(Boolean, default=False, nullable=False,
+                           comment="True when date is beyond available data")
+
+    # Relationship
+    run = relationship("ForecastRun", back_populates="points")
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "forecast_date", name="uq_forecast_points_run_date"),
+        Index("ix_forecast_points_run_date", "run_id", "forecast_date"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ForecastPoint run={self.run_id} date={self.forecast_date} "
+            f"yhat={self.yhat} actual={self.actual}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# ForecastEvaluation  (Stage 5)
+# ---------------------------------------------------------------------------
+
+class ForecastEvaluation(Base):
+    """
+    Aggregated error metrics for a completed ForecastRun.
+
+    One row per ForecastRun (1-to-1 relationship).
+
+    Metrics:
+        mae  – Mean Absolute Error
+        rmse – Root Mean Squared Error
+        mape – Mean Absolute Percentage Error (NULL when any actual == 0)
+        wape – Weighted Absolute Percentage Error (always computed; robust to zeros)
+              = sum(|actual - predicted|) / sum(actual)
+    """
+
+    __tablename__ = "forecast_evaluations"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    run_id = Column(
+        Integer,
+        ForeignKey("forecast_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+
+    mae           = Column(Numeric(14, 4), nullable=True)
+    rmse          = Column(Numeric(14, 4), nullable=True)
+    mape          = Column(Numeric(10, 4), nullable=True,
+                           comment="NULL when any actual=0 (undefined)")
+    wape          = Column(Numeric(10, 4), nullable=True,
+                           comment="Weighted APE; robust to zero actuals")
+    n_eval_points = Column(Integer, nullable=False, default=0,
+                           comment="number of test-period rows used in evaluation")
+
+    computed_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    # Relationship
+    run = relationship("ForecastRun", back_populates="evaluation")
+
+    def __repr__(self) -> str:
+        return (
+            f"<ForecastEvaluation run={self.run_id} "
+            f"mae={self.mae} rmse={self.rmse} wape={self.wape}>"
+        )
+
